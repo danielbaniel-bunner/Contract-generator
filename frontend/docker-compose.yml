@@ -1,0 +1,9 @@
+services:
+  frontend:
+    build:
+      context: .
+    image: frontend:latest
+    env_file:
+      - .env          # 👈 ensures VITE_BACKEND_URL is available at build
+    ports:
+      - "5173:80"

@@ -1,0 +1,7 @@
+services:
+  backend:
+    build: .
+    env_file:
+      - .env     # 👈 this pulls in your local .env file
+    ports:
+      - "8000:8000"
