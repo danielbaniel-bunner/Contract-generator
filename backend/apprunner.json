@@ -1,0 +1,23 @@
+{
+  "ServiceName": "contract-gen",
+  "SourceConfiguration": {
+    "ImageRepository": {
+      "ImageIdentifier": "184766093269.dkr.ecr.us-east-1.amazonaws.com/contract-gen:latest",
+      "ImageRepositoryType": "ECR",
+      "ImageConfiguration": {
+        "Port": "8000",
+        "RuntimeEnvironmentVariables": {
+          "PYTHONUNBUFFERED": "1"
+        }
+      }
+    },
+    "AutoDeploymentsEnabled": true,
+    "AuthenticationConfiguration": {
+      "AccessRoleArn": "arn:aws:iam::184766093269:role/AppRunnerECRAccessRole"
+    }
+  },
+  "InstanceConfiguration": {
+    "Cpu": "0.5 vCPU",
+    "Memory": "1 GB"
+  }
+}

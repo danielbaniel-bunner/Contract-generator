@@ -7,12 +7,16 @@ from logging_utils import jlog
 from config import CORS_ORIGINS
 from models import GenerateRequest, StopRequest, Job, JOBS
 from services import run_job, sse
+import os
+import dotenv
+# Load env
+dotenv.load_dotenv()
 
 app = FastAPI(title="Contract Generator (LLM-Guided, Non-Specific, Logged)", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=[os.getenv("FRONTEND_ORIGIN", "*")],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
