@@ -1,31 +1,49 @@
 import asyncio
+import os
+import time
+import dotenv
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from logging_utils import jlog
-from config import CORS_ORIGINS
+from config import CORS_ORIGINS  # optional; keep if you use it elsewhere
 from models import GenerateRequest, StopRequest, Job, JOBS
 from services import run_job, sse
-import os
-import dotenv
+
 # Load env
 dotenv.load_dotenv()
 
-app = FastAPI(title="Contract Generator (LLM-Guided, Non-Specific, Logged)", version="2.0")
+app = FastAPI(
+    title="Contract Generator (LLM-Guided, Non-Specific, Logged)",
+    version="2.0",
+)
 
+# ---- Global no-store middleware (avoid proxy/browser caching) ----
+class NoStore(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        resp = await call_next(request)
+        resp.headers.setdefault("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        resp.headers.setdefault("Pragma", "no-cache")
+        resp.headers.setdefault("Vary", "Origin")
+        return resp
+
+app.add_middleware(NoStore)
+
+# ---- CORS (permissive for now; tighten later) ----
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.getenv("FRONTEND_ORIGIN", "*")],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,  # must be False with wildcard origins
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Middleware: request logging
+# ---- Request logging middleware ----
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    import time
     start = time.monotonic()
     jlog("http.request.start", method=request.method, path=request.url.path)
     try:
@@ -42,6 +60,10 @@ async def log_requests(request: Request, call_next):
 
 # -------- Routes --------
 
+@app.get("/healthz")
+def h():
+    return {"ok": True, "version": os.getenv("APP_VERSION", "unknown")}
+
 @app.post("/generate")
 async def generate(req: GenerateRequest):
     jlog("route.generate", prompt_len=len(req.prompt))
@@ -49,27 +71,34 @@ async def generate(req: GenerateRequest):
     JOBS[job.id] = job
     job.task = asyncio.create_task(run_job(job, JOBS))
     jlog("job.created", job_id=job.id, active_jobs=len(JOBS))
-    return {"jobId": job.id}
+    # Make the JSON uncacheable too
+    return JSONResponse(
+        {"jobId": job.id},
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+    )
 
 @app.get("/stream/{job_id}")
 async def stream(job_id: str, request: Request):
     jlog("route.stream.open", job_id=job_id)
     job = JOBS.get(job_id)
-    headers = {
-        "Cache-Control": "no-cache",
+
+    sse_headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
         "Connection": "keep-alive",
-        "Content-Type": "text/event-stream",
+        "X-Accel-Buffering": "no",  # discourage proxy buffering
     }
 
     if not job:
         jlog("stream.missing", job_id=job_id)
         async def done_iter():
+            # Standard SSE retry directive, then a done event
             yield "retry: 60000\n\n"
             yield "event: done\n\ndata:\n\n"
-        return StreamingResponse(done_iter(), headers=headers)
+        return StreamingResponse(done_iter(), media_type="text/event-stream", headers=sse_headers)
 
     async def event_iter():
         try:
+            # Tell the client to retry in case of disconnects
             yield "retry: 60000\n\n"
             while True:
                 if await request.is_disconnected():
@@ -87,11 +116,12 @@ async def stream(job_id: str, request: Request):
                     if "event: done" in msg:
                         break
                 except asyncio.TimeoutError:
+                    # SSE comment line as keep-alive
                     yield ": keep-alive\n\n"
         finally:
             jlog("stream.close", job_id=job_id)
 
-    return StreamingResponse(event_iter(), headers=headers)
+    return StreamingResponse(event_iter(), media_type="text/event-stream", headers=sse_headers)
 
 @app.post("/stop")
 async def stop(req: StopRequest):

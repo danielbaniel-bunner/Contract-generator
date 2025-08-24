@@ -24,4 +24,5 @@ COPY . /app
 EXPOSE 8000
 
 # Health: prefer explicit module path
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python","-m","uvicorn","app:app","--host","0.0.0.0","--port","8000", "--workers","1","--proxy-headers","--forwarded-allow-ips","*","--timeout-keep-alive","65","--log-level","info"]
+

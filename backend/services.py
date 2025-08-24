@@ -4,14 +4,15 @@ contract_pipeline_v3.py — Clean pipeline matching your exact 6-step spec (RAG-
 Pipeline:
 1) Infer jurisdiction + contract type from user prompt (GENERAL defaults if unclear)
 2) Generate specific drafting guidelines + jurisdiction considerations (PRIVATE context)
-3) Create an outline (sections + bullets) consistent with the guidelines
-4) Draft first part (front matter + global definitions)
-5) Draft the remaining sections in parallel, using (2) + (4) as context
-6) Expert QC pass and a second pass to fix — THEN stream the final HTML
+3) Create an outline (sections + bullets) consistent with the guidelines and Guidance Notes
+4) Draft first part (front matter + global definitions), folding in Guidance Notes to the 'context'
+5) Draft the remaining sections in parallel, using (2) + (4) + Guidance Notes as context
+6) Expert QC pass and a second pass to fix — THEN stream the final HTML (post-QC only)
 
 Notes
 - No clarifying questions. If info is missing, keep language GENERAL (no numeric specifics or statute names unless user supplied)
-- Streaming: only the final, post-QC HTML is streamed (per your spec)
+- Streaming: only the final, post-QC HTML is streamed (per your original v3 behavior)
+- Stage 2 'notes' are propagated to all subsequent stages (3–6)
 - SSE-based streaming utility provided
 - Minimal HTML sanitization applied before streaming
 """
@@ -21,12 +22,17 @@ import asyncio
 import json
 import os
 import re
-import time
 from typing import Any, Dict, List, Tuple
+
 import dotenv
 dotenv.load_dotenv()
+
 from logging_utils import jlog
-from config import ( OPENAI_API_KEY, OPENAI_MODEL, OUTLINE_MIN_SECTIONS, SECTION_TARGET_WORDS, MAX_PARALLEL_SECTIONS, JOB_TTL_SECONDS, STREAM_CHARS_PER_EVENT, STREAM_DELAY_MS )
+from config import (
+    OPENAI_API_KEY, OPENAI_MODEL,
+    OUTLINE_MIN_SECTIONS, SECTION_TARGET_WORDS, MAX_PARALLEL_SECTIONS,
+    JOB_TTL_SECONDS, STREAM_CHARS_PER_EVENT, STREAM_DELAY_MS
+)
 
 from openai import AsyncOpenAI
 
@@ -45,6 +51,7 @@ def sse(event: str, data: str) -> str:
     return msg
 
 async def stream_html(queue, html: str):
+    """Final-only streaming as plain-text 'chunk' events (matches v3 frontend)."""
     n = len(html)
     i = 0
     while i < n:
@@ -129,13 +136,13 @@ async def stage2_guidelines(contract_type: str, jurisdiction: str) -> Dict[str, 
         "You are a senior contracts lawyer. Produce PRIVATE drafting guidance as JSON.\n"
         "No questions. Keep guidance general; include jurisdiction considerations without naming statutes unless the brief explicitly included them.\n"
         "Return ONLY JSON: {\"html\":str,\"notes\":str}.\n"
-        "'html' must be ONE <section> fragment with <h2>Guidelines</h2> and subheads (Scope, Payment, Data/Security, IP, Confidentiality, Indemnities, Liability, Disputes, Boilerplate).\n"
-        "'notes' ≤ 600 chars summarizing key allocations to keep consistent.\n"
+        "'html' must be ONE <section> fragment with <h2>Guidelines</h2> and subheads (Scope, Payment, Data/Security, IP, Confidentiality, Indemnities, Liability, Disputes, Boilerplate etc).\n"
+        "'notes' ≤ 1000 chars summarizing key allocations to keep consistent.\n"
     )
     user = (
         f"Contract Type: {contract_type or 'Agreement'}\n"
         f"Jurisdiction: {jurisdiction or 'Applicable Law'}\n"
-        "Generate neutral guidance and venue-specific considerations phrased generally (e.g., 'under applicable law in the named venue')."
+        "Generate guidance and venue-specific considerations phrased generally for writing a {contract_type} contract under {jurisdiction} jurisdiction (e.g., 'under applicable law in the named venue')."
     )
     data = await chat_json([
         {"role": "system", "content": system},
@@ -145,7 +152,13 @@ async def stage2_guidelines(contract_type: str, jurisdiction: str) -> Dict[str, 
 
 # ----------------------------- Stage 3 — Outline -----------------------------
 
-async def stage3_outline(contract_type: str, jurisdiction: str, guidelines_html: str, user_prompt: str) -> Dict[str, Any]:
+async def stage3_outline(
+    contract_type: str,
+    jurisdiction: str,
+    guidelines_html: str,
+    guidance_notes: str,
+    user_prompt: str
+) -> Dict[str, Any]:
     system = (
         "You are a legal architect. Create an outline that follows provided guidelines.\n"
         "Return ONLY JSON: {\"sections\":[{\"number\":str,\"title\":str,\"target_words\":int,\"bullets\":[str,...]}...]}.\n"
@@ -155,6 +168,7 @@ async def stage3_outline(contract_type: str, jurisdiction: str, guidelines_html:
         f"Contract Type: {contract_type or 'Agreement'}\n"
         f"Jurisdiction: {jurisdiction or 'Applicable Law'}\n"
         f"Guidelines (HTML):\n{guidelines_html}\n\n"
+        f"Guidance notes (plain text; keep the outline consistent with these allocations):\n{guidance_notes}\n\n"
         f"User brief (context only):\n{user_prompt}\n"
     )
     data = await chat_json([
@@ -188,13 +202,20 @@ async def stage3_outline(contract_type: str, jurisdiction: str, guidelines_html:
 
 # ----------------------------- Stage 4 — First Part -----------------------------
 
-async def stage4_first_part(title: str, contract_type: str, jurisdiction: str, parties: List[str], sections: List[Dict[str, Any]]) -> Dict[str, str]:
+async def stage4_first_part(
+    title: str,
+    contract_type: str,
+    jurisdiction: str,
+    parties: List[str],
+    sections: List[Dict[str, Any]],
+    guidance_notes: str
+) -> Dict[str, str]:
     system = (
         "You are a senior drafter. Return ONLY JSON {\"html\":str,\"context\":str}.\n"
         "'html' must contain two fragments: <section id='front-matter'> and <section id='global-definitions'>.\n"
         "- Keep wording GENERAL (no numeric specifics unless present in the brief).\n"
         "- No statute names unless present in the brief.\n"
-        "'context' is ≤ 1000 chars summary of defined capitalized terms and drafting constraints (renewal centralization, etc.).\n"
+        "'context' is ≤ 1000 chars summarizing defined capitalized terms, key drafting constraints, and the Guidance Notes allocations (renewal centralization, etc.).\n"
     )
     parties = parties or ["Party A", "Party B"]
     user = (
@@ -202,7 +223,9 @@ async def stage4_first_part(title: str, contract_type: str, jurisdiction: str, p
         f"Contract Type: {contract_type or 'Agreement'}\n"
         f"Jurisdiction: {jurisdiction or 'Applicable Law'}\n"
         f"Parties: {parties[0]} and {parties[1]}\n"
-        "Anticipated Sections:\n" + "\n".join(f"- {s['number']} {s['title']}" for s in sections)
+        "Anticipated Sections:\n" + "\n".join(f"- {s['number']} {s['title']}" for s in sections) +
+        "\nGuidance notes (plain text; do not echo verbatim, but reflect their allocations consistently):\n" +
+        f"{guidance_notes}\n"
     )
     data = await chat_json([
         {"role": "system", "content": system},
@@ -212,7 +235,11 @@ async def stage4_first_part(title: str, contract_type: str, jurisdiction: str, p
 
 # ----------------------------- Stage 5 — Section drafting (parallel) -----------------------------
 
-async def stage5_section_worker(i: int, s: Dict[str, Any], *, title: str, contract_type: str, jurisdiction: str, parties: List[str], guidelines_html: str, first_part_html: str, shared_context: str) -> Tuple[int, str]:
+async def stage5_section_worker(
+    i: int, s: Dict[str, Any], *,
+    title: str, contract_type: str, jurisdiction: str, parties: List[str],
+    guidelines_html: str, first_part_html: str, shared_context: str
+) -> Tuple[int, str]:
     system = (
         "Draft ONE section as valid HTML fragment.\n"
         "Start with <h2>{number} {title}</h2>. Use <p>, <ol>, <ul>, optional <h3>.\n"
@@ -240,7 +267,10 @@ async def stage5_section_worker(i: int, s: Dict[str, Any], *, title: str, contra
     ], temperature=0.35, max_tokens=2200)
     return i, html
 
-async def stage5_sections_parallel(title: str, contract_type: str, jurisdiction: str, parties: List[str], sections: List[Dict[str, Any]], guidelines_html: str, first_part_html: str, shared_context: str) -> List[str]:
+async def stage5_sections_parallel(
+    title: str, contract_type: str, jurisdiction: str, parties: List[str],
+    sections: List[Dict[str, Any]], guidelines_html: str, first_part_html: str, shared_context: str
+) -> List[str]:
     sem = asyncio.Semaphore(MAX_PARALLEL_SECTIONS)
     results: Dict[int, str] = {}
 
@@ -264,7 +294,12 @@ async def stage5_sections_parallel(title: str, contract_type: str, jurisdiction:
 
 # ----------------------------- Stage 6 — QC & Fix -----------------------------
 
-async def stage6_qc_and_fix(full_html: str, contract_type: str, jurisdiction: str) -> str:
+async def stage6_qc_and_fix(
+    full_html: str,
+    contract_type: str,
+    jurisdiction: str,
+    guidance_notes: str
+) -> str:
     system_eval = (
         "You are an expert contracts reviewer. Evaluate the HTML contract for structure, coherence, defined terms consistency, and missing essentials.\n"
         "Return ONLY JSON {\"issues\":[str,...],\"should_fix\":bool}. Do not include the contract text.\n"
@@ -272,6 +307,7 @@ async def stage6_qc_and_fix(full_html: str, contract_type: str, jurisdiction: st
     user_eval = (
         f"Contract Type: {contract_type or 'Agreement'}\n"
         f"Jurisdiction: {jurisdiction or 'Applicable Law'}\n"
+        f"Guidance notes to enforce across the draft (allocations, risk positions):\n{guidance_notes}\n"
         "Contract HTML to evaluate follows:\n" + full_html
     )
     review = await chat_json([
@@ -284,14 +320,16 @@ async def stage6_qc_and_fix(full_html: str, contract_type: str, jurisdiction: st
 
     system_fix = (
         "You are an expert contracts drafter. You will fix the given HTML contract in a single pass.\n"
-        "Rules: keep language GENERAL unless the brief included specifics; preserve headings and numbering;\n"
-        "ensure renewal is centralized; avoid statute names; ensure defined terms consistency; no placeholders; valid HTML only.\n"
+        "Rules: keep language GENERAL unless the brief included specifics; preserve headings and numbering; "
+        "ensure renewal is centralized; avoid statute names; ensure defined terms consistency; no placeholders; "
+        "valid HTML only. Critically, align the document with the Guidance Notes allocations provided.\n"
         "Output ONLY the corrected HTML fragment (no JSON, no commentary).\n"
     )
     user_fix = (
         f"Contract Type: {contract_type or 'Agreement'}\n"
         f"Jurisdiction: {jurisdiction or 'Applicable Law'}\n"
         f"Known issues: {json.dumps(review.get('issues', []))}\n"
+        f"Guidance notes (authoritative for allocations):\n{guidance_notes}\n"
         "Original HTML follows (fix inline):\n" + full_html
     )
     fixed = await chat_text([
@@ -325,27 +363,40 @@ async def run_job(job: Job, jobs_registry: Dict[str, Job]):
         # 2) Guidelines (PRIVATE)
         guide = await stage2_guidelines(vars1["contract_type"], vars1["jurisdiction"])
         await job.queue.put(sse("progress", "guidelines_ready"))
+        jlog("stage2.notes_present", bool=bool(guide.get("notes")))
 
-        # 3) Outline
-        outline = await stage3_outline(vars1["contract_type"], vars1["jurisdiction"], guide["html"], job.prompt)
+        # 3) Outline (pass notes)
+        outline = await stage3_outline(
+            vars1["contract_type"], vars1["jurisdiction"],
+            guide.get("html", ""), guide.get("notes", ""), job.prompt
+        )
         await job.queue.put(sse("outline", json.dumps(outline)))
 
-        # 4) First part
-        first = await stage4_first_part(vars1["title"], vars1["contract_type"], vars1["jurisdiction"], vars1["parties"], outline["sections"])
+        # 4) First part (pass notes so 'context' reflects allocations)
+        first = await stage4_first_part(
+            vars1["title"], vars1["contract_type"], vars1["jurisdiction"], vars1["parties"],
+            outline["sections"], guide.get("notes", "")
+        )
         await job.queue.put(sse("progress", "first_part_ready"))
 
-        # 5) Sections (parallel, but do not stream yet)
+        # 5) Sections (parallel; shared_context includes Stage 2 notes + Stage 4 context)
+        shared_context = (
+            f"Guidance notes (authoritative allocations to keep consistent): {guide.get('notes','')}\n"
+            f"Stage 4 context (defined terms & constraints): {first.get('context','')}"
+        )
         section_html_list = await stage5_sections_parallel(
             vars1["title"], vars1["contract_type"], vars1["jurisdiction"], vars1["parties"],
-            outline["sections"], guide["html"], first["html"], first["context"],
+            outline["sections"], guide.get("html",""), first.get("html",""), shared_context,
         )
         await job.queue.put(sse("progress", "sections_done"))
 
         # Merge all parts
         full_html = first["html"] + "\n" + "\n".join(section_html_list)
 
-        # 6) QC then Fix
-        fixed_html = await stage6_qc_and_fix(full_html, vars1["contract_type"], vars1["jurisdiction"])
+        # 6) QC then Fix (pass notes)
+        fixed_html = await stage6_qc_and_fix(
+            full_html, vars1["contract_type"], vars1["jurisdiction"], guide.get("notes","")
+        )
 
         # Stream final HTML only now
         final_html = sanitize_html(fixed_html)
